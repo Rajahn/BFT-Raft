@@ -1,6 +1,9 @@
 package raft
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 type LogEntry struct {
 	Term         int         // the log entry's term
@@ -17,6 +20,9 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	Entries      []LogEntry
+
+	// leader在分发日志时, 带上自己的commitIndex, 供follower执行apply
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -41,7 +47,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// return failure if prevLog not matched
-	if args.PrevLogIndex > len(rf.log) {
+	if args.PrevLogIndex >= len(rf.log) {
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower log too short, Len:%d < Prev:%d", args.LeaderId, len(rf.log), args.PrevLogIndex)
 		return
 	}
@@ -55,7 +61,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
 
-	// TODO: hanle LeaderCommit
+	// hanle LeaderCommit, 当follower发现leader的commitindex比自己大, 说明有日志可以被apply, 触发application工作流
+	if args.LeaderCommit > rf.commitIndex {
+		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index %d->%d", rf.commitIndex, args.LeaderCommit)
+		rf.commitIndex = args.LeaderCommit
+		rf.applyCond.Signal()
+	}
 
 	rf.resetElectionTimerLocked()
 }
@@ -64,7 +75,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
-func (rf *Raft) replicateToPeer(peer int, args *AppendEntriesArgs) {
+
+// leader分发日志的安全性保证, 只能分发本term的日志, 不能重发之前的, 否则可能造成覆盖
+func (rf *Raft) replicateToPeer(peer, term int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(peer, args, reply)
 
@@ -78,6 +91,11 @@ func (rf *Raft) replicateToPeer(peer int, args *AppendEntriesArgs) {
 	// align the term
 	if reply.Term > rf.currentTerm {
 		rf.becomeFollowerLocked(reply.Term)
+		return
+	}
+	//如果在某次执行分发的rpc后,leader身份已经丢失, 则不再处理
+	if rf.contextLostLocked(Leader, term) {
+		LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Context Lost, T%d:Leader->T%d:%s", peer, term, rf.currentTerm, rf.role)
 		return
 	}
 
@@ -98,8 +116,24 @@ func (rf *Raft) replicateToPeer(peer int, args *AppendEntriesArgs) {
 	rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 	rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 
-	// TODO: update the commitIndex
+	// leader在执行了一次成功的日志分发后, 计算是否有新的日志被半数以上peer保存, 可以被提交apply
+	majorityMatched := rf.getMajorityIndexLocked()
+	if majorityMatched > rf.commitIndex {
+		LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index %d->%d", rf.commitIndex, majorityMatched)
+		rf.commitIndex = majorityMatched
+		rf.applyCond.Signal()
+	}
 }
+
+func (rf *Raft) getMajorityIndexLocked() int {
+	tmpIndexes := make([]int, len(rf.peers))
+	copy(tmpIndexes, rf.matchIndex)
+	sort.Ints(tmpIndexes)
+	majorityIdx := (len(rf.peers) - 1) / 2
+	LOG(rf.me, rf.currentTerm, DDebug, "Match index after sort: %v, majority[%d]=%d", tmpIndexes, majorityIdx, tmpIndexes[majorityIdx])
+	return tmpIndexes[majorityIdx]
+}
+
 func (rf *Raft) startReplication(term int) bool {
 
 	rf.mu.Lock()
@@ -125,8 +159,9 @@ func (rf *Raft) startReplication(term int) bool {
 			PrevLogIndex: prevIdx,
 			PrevLogTerm:  prevTerm,
 			Entries:      rf.log[prevIdx+1:], //从leader自身的日志列表里, 找到对应peer应该添加的部分
+			LeaderCommit: rf.commitIndex,
 		}
-		go rf.replicateToPeer(peer, args)
+		go rf.replicateToPeer(peer, term, args)
 	}
 
 	return true

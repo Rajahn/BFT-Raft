@@ -38,7 +38,7 @@ const (
 	electionTimeoutMin = 250 * time.Millisecond
 	electionTimeoutMax = 400 * time.Millisecond
 	// 心跳间隔
-	replicateInterval = 200 * time.Millisecond
+	replicateInterval = 70 * time.Millisecond
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -84,6 +84,12 @@ type Raft struct {
 	// every peer's view
 	nextIndex  []int //用于leader维护每个peer的下一个要发送的日志条目的索引, 是试探性的
 	matchIndex []int //用于记录全局每个peer已成功同步的日志进度, 据此可以推算出CommitIndex
+
+	// fields for apply loop
+	commitIndex int
+	lastApplied int
+	applyCh     chan ApplyMsg
+	applyCond   *sync.Cond
 
 	electionStart   time.Time
 	electionTimeout time.Duration // random
@@ -199,13 +205,20 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (PartB).
+	if rf.role != Leader {
+		return 0, 0, false
+	}
+	rf.log = append(rf.log, LogEntry{
+		CommandValid: true,
+		Command:      command,
+		Term:         rf.currentTerm,
+	})
+	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", len(rf.log)-1, rf.currentTerm)
 
-	return index, term, isLeader
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -260,11 +273,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
+	// initialize the fields used for apply
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
+
+	go rf.applicationTicker()
 
 	return rf
 }
