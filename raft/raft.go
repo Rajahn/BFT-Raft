@@ -77,6 +77,14 @@ type Raft struct {
 	currentTerm int
 	votedFor    int // -1 means vote for none
 
+	// log in the Peer's local
+	log []LogEntry
+
+	// only used in Leader
+	// every peer's view
+	nextIndex  []int //用于leader维护每个peer的下一个要发送的日志条目的索引, 是试探性的
+	matchIndex []int //用于记录全局每个peer已成功同步的日志进度, 据此可以推算出CommitIndex
+
 	electionStart   time.Time
 	electionTimeout time.Duration // random
 }
@@ -115,6 +123,11 @@ func (rf *Raft) becomeLeaderLocked() {
 
 	LOG(rf.me, rf.currentTerm, DLeader, "Become Leader in T%d", rf.currentTerm)
 	rf.role = Leader
+
+	for peer := 0; peer < len(rf.peers); peer++ {
+		rf.nextIndex[peer] = len(rf.log) //先假设所有peer都没有落后, 是与leader同步的,然后再逐步试探后退
+		rf.matchIndex[peer] = 0          //初始化为0, 代表在每个peer上还没有任何日志可以被认为是已提交的
+	}
 }
 
 // return currentTerm and whether this server
@@ -238,6 +251,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
+
+	// a dummy entry to aovid lots of corner checks
+	// 注意, 把0号日志留空, 作为哨兵
+	rf.log = append(rf.log, LogEntry{})
+
+	// initialize the leader's view slice
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 

@@ -2,9 +2,21 @@ package raft
 
 import "time"
 
+type LogEntry struct {
+	Term         int         // the log entry's term
+	CommandValid bool        // if it should be applied
+	Command      interface{} // the command should be applied to the state machine
+}
+
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
+
+	// used to probe the match point
+	// leader在尝试分发日志时, 要带上自己上一条已经提交的日志的索引和任期, 供follower检查
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
 }
 
 type AppendEntriesReply struct {
@@ -16,6 +28,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	reply.Term = rf.currentTerm //在reply中记录自己当前保存日志的term, 便于leader回退匹配
+	reply.Success = false
+
 	// align the term
 	if args.Term < rf.currentTerm {
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Higher term, T%d<T%d", args.LeaderId, args.Term, rf.currentTerm)
@@ -24,6 +39,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term >= rf.currentTerm {
 		rf.becomeFollowerLocked(args.Term)
 	}
+
+	// return failure if prevLog not matched
+	if args.PrevLogIndex > len(rf.log) {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower log too short, Len:%d < Prev:%d", args.LeaderId, len(rf.log), args.PrevLogIndex)
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Prev log not match, [%d]: T%d != T%d", args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		return
+	}
+
+	// append the leader log entries to local
+	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	reply.Success = true
+	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
+
+	// TODO: hanle LeaderCommit
 
 	rf.resetElectionTimerLocked()
 }
@@ -48,6 +80,25 @@ func (rf *Raft) replicateToPeer(peer int, args *AppendEntriesArgs) {
 		rf.becomeFollowerLocked(reply.Term)
 		return
 	}
+
+	// hanle the reply
+	// probe the lower index if the prevLog not matched
+	if !reply.Success {
+		// go back a term
+		idx, term := args.PrevLogIndex, args.PrevLogTerm
+		for idx > 0 && rf.log[idx].Term == term {
+			idx--
+		}
+		rf.nextIndex[peer] = idx + 1
+		LOG(rf.me, rf.currentTerm, DLog, "Not match with S%d in %d, try next=%d", peer, args.PrevLogIndex, rf.nextIndex[peer])
+		return
+	}
+
+	// update match/next index if log appended successfully
+	rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+	rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+
+	// TODO: update the commitIndex
 }
 func (rf *Raft) startReplication(term int) bool {
 
@@ -61,12 +112,19 @@ func (rf *Raft) startReplication(term int) bool {
 
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
+			rf.matchIndex[peer] = len(rf.log) - 1 // leader自己的日志第一条是哨兵, 因此-1
+			rf.nextIndex[peer] = len(rf.log)
 			continue
 		}
 
+		prevIdx := rf.nextIndex[peer] - 1
+		prevTerm := rf.log[prevIdx].Term
 		args := &AppendEntriesArgs{
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevIdx,
+			PrevLogTerm:  prevTerm,
+			Entries:      rf.log[prevIdx+1:], //从leader自身的日志列表里, 找到对应peer应该添加的部分
 		}
 		go rf.replicateToPeer(peer, args)
 	}
