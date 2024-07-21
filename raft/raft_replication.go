@@ -46,6 +46,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.becomeFollowerLocked(args.Term)
 	}
 
+	//在收到leader的日志分发请求(心跳)后, 重置自己的选举计时器, 无论是否接受
+	defer rf.resetElectionTimerLocked()
 	// return failure if prevLog not matched
 	if args.PrevLogIndex >= len(rf.log) {
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower log too short, Len:%d < Prev:%d", args.LeaderId, len(rf.log), args.PrevLogIndex)
@@ -58,6 +60,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// append the leader log entries to local
 	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.persistLocked()
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
 
@@ -68,7 +71,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyCond.Signal()
 	}
 
-	rf.resetElectionTimerLocked()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -118,7 +120,8 @@ func (rf *Raft) replicateToPeer(peer, term int, args *AppendEntriesArgs) {
 
 	// leader在执行了一次成功的日志分发后, 计算是否有新的日志被半数以上peer保存, 可以被提交apply
 	majorityMatched := rf.getMajorityIndexLocked()
-	if majorityMatched > rf.commitIndex {
+	//确保检查的是本term日志
+	if majorityMatched > rf.commitIndex && rf.log[majorityMatched].Term == rf.currentTerm {
 		LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index %d->%d", rf.commitIndex, majorityMatched)
 		rf.commitIndex = majorityMatched
 		rf.applyCond.Signal()
