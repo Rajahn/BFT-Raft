@@ -19,7 +19,6 @@ package raft
 
 import (
 	"BFT-Raft/labrpc"
-
 	"sync"
 	"sync/atomic"
 	"time"

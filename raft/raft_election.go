@@ -17,6 +17,48 @@ func (rf *Raft) isElectionTimeoutLocked() bool {
 	return time.Since(rf.electionStart) > rf.electionTimeout
 }
 
+// 预投票阶段，请求其他节点给自己投票，但是还需要Candidate提供Committed证明后Follower才会真正投票
+type PreRequestVoteArgs struct {
+	Term         int // Candidate Term
+	CandidateId  int // Candidate Id
+	LastLogTerm  int // Candidate当前最后一个日志项的 Term（可能伪造）
+	LastLogIndex int // Candidate当前最后一个日志项的 Index（可能伪造）
+}
+
+// 预投票响应，包含待证明日志项的 Index 和 Term。
+type PreRequestVoteReply struct {
+	Success              bool
+	ReceiverId           int
+	ReceiverLastLogTerm  int
+	ReceiverLastLogIndex int
+}
+
+// PreRequest 只询问peer最新的日志项是什么,校验是否应该投票, 接下来还需要candidate向peer证明, peer才会真正投票
+func (rf *Raft) PreRequestVote(args *PreRequestVoteArgs, reply *PreRequestVoteReply) {
+
+	reply.Success = false // 默认为失败
+
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DVote, "PreRequestVoteArgs : args.Term < rf.currentTerm")
+		return
+	}
+
+	// 检查候选人的日志是否最新, 接下来需要candidate向当前peer证明确实至少持有更新的日志
+	if !rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
+		reply.ReceiverId = rf.me
+		l := len(rf.log)
+		reply.ReceiverLastLogTerm = rf.log[l-1].Term
+		reply.ReceiverLastLogIndex = l - 1
+		reply.Success = true
+	}
+
+}
+
+func (rf *Raft) sendPreRequestVote(server int, args *PreRequestVoteArgs, reply *PreRequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.PreRequestVote", args, reply)
+	return ok
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
@@ -24,8 +66,8 @@ type RequestVoteArgs struct {
 	Term        int
 	CandidateId int
 
-	LastLogIndex int
-	LastLogTerm  int
+	// Committed 证明
+	NeedProveLastLogHash string // 对方节点最后一个日志项的 Hash
 }
 
 // example RequestVote RPC reply structure.
@@ -60,11 +102,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// check if candidate's last log is more up to date
-	if rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject voted, Candidate less up-to-date", args.CandidateId)
+	//////////////////// Begin Committed 证明 ////////////////////
+	l := len(rf.log)
+	hash, _ := SHA256(rf.log[l-1])
+	if args.NeedProveLastLogHash != hash {
+		reply.Term = args.Term
+		reply.VoteGranted = false
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject voted, Last log hash not match", args.CandidateId)
 		return
 	}
+	//////////////////// End Committed 证明 ////////////////////
 
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
@@ -117,9 +164,29 @@ func (rf *Raft) isMoreUpToDateLocked(candidateIndex, candidateTerm int) bool {
 	return lastIndex > candidateIndex
 }
 
-func (rf *Raft) askVoteFromPeer(term, peer int, args *RequestVoteArgs, votes chan bool) {
-	reply := &RequestVoteReply{}
-	ok := rf.sendRequestVote(peer, args, reply)
+func (rf *Raft) askVoteFromPeer(term, peer int, args *PreRequestVoteArgs, votes chan bool) {
+	preReply := &PreRequestVoteReply{}
+	ok := rf.sendPreRequestVote(peer, args, preReply)
+
+	if !ok || !preReply.Success {
+		//预投票校验不通过
+		return
+	}
+
+	reply := RequestVoteReply{}
+	requestVoteArgs := RequestVoteArgs{}
+
+	if preReply.ReceiverLastLogTerm > rf.currentTerm || preReply.ReceiverLastLogIndex >= len(rf.log) {
+		rf.becomeFollowerLocked(reply.Term)
+		votes <- false
+		return
+	}
+
+	requestVoteArgs.CandidateId = rf.me
+	requestVoteArgs.Term = rf.currentTerm
+	requestVoteArgs.NeedProveLastLogHash, _ = SHA256(rf.log[preReply.ReceiverLastLogIndex]) //candidate计算peer要求证明持有的日志项的hash
+
+	ok = rf.sendRequestVote(preReply.ReceiverId, &requestVoteArgs, &reply)
 
 	// handle the response
 	rf.mu.Lock()
@@ -168,8 +235,8 @@ func (rf *Raft) startElection(term int) {
 			count++
 			continue
 		}
-
-		args := &RequestVoteArgs{
+		// 首先开始预投票, 确定要验证的Term-Index是什么
+		args := &PreRequestVoteArgs{
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
 			LastLogIndex: l - 1,
@@ -178,6 +245,7 @@ func (rf *Raft) startElection(term int) {
 
 		go rf.askVoteFromPeer(term, peer, args, votes)
 	}
+
 	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers)-1; i++ {
