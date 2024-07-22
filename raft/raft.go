@@ -92,6 +92,8 @@ type Raft struct {
 
 	electionStart   time.Time
 	electionTimeout time.Duration // random
+
+	m map[AppendEntriesCommitKey]int // 记录每个日志项的提交次数
 }
 
 func (rf *Raft) becomeFollowerLocked(term int) {
@@ -262,6 +264,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+
+	rf.m = make(map[AppendEntriesCommitKey]int)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

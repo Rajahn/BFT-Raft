@@ -7,7 +7,7 @@ func (rf *Raft) applicationTicker() {
 		rf.mu.Lock()
 		rf.applyCond.Wait()
 		entries := make([]LogEntry, 0)
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		for i := rf.lastApplied + 1; i <= rf.commitIndex && i < len(rf.log); i++ {
 			entries = append(entries, rf.log[i])
 		}
 		rf.mu.Unlock()

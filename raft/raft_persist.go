@@ -32,6 +32,7 @@ func (rf *Raft) persistLocked() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.m)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
 	LOG(rf.me, rf.currentTerm, DPersist, "Persist: %v", rf.persistString())
@@ -58,6 +59,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
+	var m map[AppendEntriesCommitKey]int
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -78,5 +80,12 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	rf.log = log
+
+	if err := d.Decode(&m); err != nil {
+		LOG(rf.me, rf.currentTerm, DPersist, "Read m error: %v", err)
+		return
+	}
+	rf.m = m
+
 	LOG(rf.me, rf.currentTerm, DPersist, "Read from persist: %v", rf.persistString())
 }

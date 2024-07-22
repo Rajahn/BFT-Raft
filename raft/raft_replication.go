@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"sort"
 	"time"
 )
 
@@ -9,6 +8,8 @@ type LogEntry struct {
 	Term         int         // the log entry's term
 	CommandValid bool        // if it should be applied
 	Command      interface{} // the command should be applied to the state machine
+	Signature    []byte
+	AcceptCount  int //当前日志项在所有节点中, 已经被多少节点确认持有
 }
 
 type AppendEntriesArgs struct {
@@ -25,6 +26,20 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+type AppendEntriesCommitArgs struct {
+	Term       int
+	PeerId     int    // 确认消息发送者Id
+	Signature  []byte // PeerId 的数字签名，用于防止拜占庭节点伪造确认消息
+	EntryIndex int
+	EntryTerm  int
+	EntryHash  string
+}
+
+type AppendEntriesCommitReply struct {
+	Term    int
+	Success bool
+}
+
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
@@ -36,6 +51,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm //在reply中记录自己当前保存日志的term, 便于leader回退匹配
 	reply.Success = false
+
+	//发现伪造的日志, 说明leader已经丢失, 立即开启选举
+	//if len(args.Entries) > 0 && !verifySignature(GetBytes(args.Entries[0].Command), args.Entries[0].Signature) {
+	//	rf.becomeCandidateLocked()
+	//	fmt.Printf("FOLLOWER %d becomes CANDIDATE..., Current Time: %v\n", rf.me, time.Now().UnixNano()/1000000)
+	//	return
+	//}
 
 	// align the term
 	if args.Term < rf.currentTerm {
@@ -57,18 +79,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Prev log not match, [%d]: T%d != T%d", args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
 		return
 	}
-
 	// append the leader log entries to local
 	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	rf.persistLocked()
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
 
-	// hanle LeaderCommit, 当follower发现leader的commitindex比自己大, 说明有日志可以被apply, 触发application工作流
-	if args.LeaderCommit > rf.commitIndex {
-		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index %d->%d", rf.commitIndex, args.LeaderCommit)
-		rf.commitIndex = args.LeaderCommit
-		rf.applyCond.Signal()
+	//追加日志后, 不去立即更新commitIndex以推进apply工作流, 而是发起一次广播, 告知其他节点某条记录已被我收到
+	for index := args.PrevLogIndex + 1; index < len(rf.log); index++ {
+		broadcastAppendEntriesCommit(rf, index, rf.log[index].Term)
 	}
 
 }
@@ -117,24 +136,48 @@ func (rf *Raft) replicateToPeer(peer, term int, args *AppendEntriesArgs) {
 	// update match/next index if log appended successfully
 	rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 	rf.nextIndex[peer] = rf.matchIndex[peer] + 1
-
-	// leader在执行了一次成功的日志分发后, 计算是否有新的日志被半数以上peer保存, 可以被提交apply
-	majorityMatched := rf.getMajorityIndexLocked()
-	//确保检查的是本term日志
-	if majorityMatched > rf.commitIndex && rf.log[majorityMatched].Term == rf.currentTerm {
-		LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index %d->%d", rf.commitIndex, majorityMatched)
-		rf.commitIndex = majorityMatched
-		rf.applyCond.Signal()
-	}
 }
 
-func (rf *Raft) getMajorityIndexLocked() int {
-	tmpIndexes := make([]int, len(rf.peers))
-	copy(tmpIndexes, rf.matchIndex)
-	sort.Ints(tmpIndexes)
-	majorityIdx := (len(rf.peers) - 1) / 2
-	LOG(rf.me, rf.currentTerm, DDebug, "Match index after sort: %v, majority[%d]=%d", tmpIndexes, majorityIdx, tmpIndexes[majorityIdx])
-	return tmpIndexes[majorityIdx]
+func broadcastAppendEntriesCommit(rf *Raft, index int, term int) {
+
+	for i := range rf.peers {
+		if i != rf.me && rf.role != Candidate {
+			args := AppendEntriesCommitArgs{Term: rf.currentTerm, PeerId: rf.me, EntryIndex: index, EntryTerm: term}
+			reply := AppendEntriesCommitReply{}
+			go func(server int) {
+				rf.sendAppendEntriesCommit(server, args, &reply)
+			}(i)
+		}
+	}
+}
+func (rf *Raft) sendAppendEntriesCommit(server int, args AppendEntriesCommitArgs, reply *AppendEntriesCommitReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntriesCommit", args, reply)
+	return ok
+}
+
+func (rf *Raft) AppendEntriesCommit(args AppendEntriesCommitArgs, reply *AppendEntriesCommitReply) {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	key := AppendEntriesCommitKey{Term: args.EntryTerm, Index: args.EntryIndex}
+	_, ok := rf.m[key]
+	if ok {
+		rf.m[key] += 1
+	} else {
+		rf.m[key] = 1
+	}
+
+	rf.persistLocked()
+
+	if rf.m[key] >= len(rf.peers)/2 && key.Index > rf.commitIndex {
+		rf.commitIndex = key.Index
+		rf.applyCond.Signal()
+		//fmt.Println("Follower ", rf.me, " m[key] ", rf.m[key], " key ", key)
+		LOG(rf.me, rf.currentTerm, DWarn, "Node update the commit index %d->%d", rf.commitIndex, key.Index)
+	}
+	//fmt.Println("Follower ", rf.me, " m[key] ", rf.m[key], " key ", key)
+	reply.Success = true
 }
 
 func (rf *Raft) startReplication(term int) bool {
