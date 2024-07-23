@@ -43,19 +43,51 @@ func (sc *ShardCtrler) requestDuplicated(clientId, seqId int64) bool {
 }
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here.
+	var opReply OpReply
+	sc.command(Op{
+		OpType:   OpJoin,
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
+		Servers:  args.Servers,
+	}, &opReply)
+
+	reply.Err = opReply.Err
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
-	// Your code here.
+	var opReply OpReply
+	sc.command(Op{
+		OpType:   OpLeave,
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
+		GIDs:     args.GIDs,
+	}, &opReply)
+
+	reply.Err = opReply.Err
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
+	var opReply OpReply
+	sc.command(Op{
+		OpType:   OpMove,
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
+		Shard:    args.Shard,
+		GID:      args.GID,
+	}, &opReply)
+
+	reply.Err = opReply.Err
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
+	var opReply OpReply
+	sc.command(Op{
+		OpType: OpQuery,
+		Num:    args.Num,
+	}, &opReply)
+
+	reply.Config = opReply.ControllerConfig
+	reply.Err = opReply.Err
 }
 
 func (sc *ShardCtrler) command(args Op, reply *OpReply) {
