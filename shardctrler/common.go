@@ -96,6 +96,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+func DefaultConfig() Config {
+	return Config{
+		Groups: make(map[int][]string),
+	}
+}
 
 type Op struct {
 	// Your definitions here.
