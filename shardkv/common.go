@@ -21,6 +21,8 @@ const (
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeout     = "ErrTimeout"
+	ErrWrongConfig = "ErrWrongConfig"
+	ErrNotReady    = "ErrNotReady"
 )
 
 type Err string
@@ -53,8 +55,9 @@ type GetReply struct {
 }
 
 const (
-	ClientRequestTimeout = 500 * time.Millisecond
-	FetchConfigInterval  = 100 * time.Millisecond
+	ClientRequestTimeout   = 500 * time.Millisecond
+	FetchConfigInterval    = 100 * time.Millisecond
+	ShardMigrationInterval = 50 * time.Millisecond
 )
 
 const Debug = false
@@ -104,4 +107,47 @@ func getOperationType(v string) OperationType {
 type LastOperationInfo struct {
 	SeqId int64
 	Reply *OpReply
+}
+
+func (op *LastOperationInfo) copyData() LastOperationInfo {
+	return LastOperationInfo{
+		SeqId: op.SeqId,
+		Reply: &OpReply{
+			Err:   op.Reply.Err,
+			Value: op.Reply.Value,
+		},
+	}
+}
+
+type RaftCommandType uint8
+
+const (
+	ClientOpeartion RaftCommandType = iota
+	ConfigChange
+	ShardMigration
+)
+
+type RaftCommand struct {
+	CmdType RaftCommandType
+	Data    interface{}
+}
+type ShardStatus uint8
+
+const (
+	Normal ShardStatus = iota
+	MoveIn
+	MoveOut
+	GC
+)
+
+type ShardOperationArgs struct {
+	ConfigNum int
+	ShardIds  []int
+}
+
+type ShardOperationReply struct {
+	Err            Err
+	ConfigNum      int
+	ShardData      map[int]map[string]string
+	DuplicateTable map[int64]LastOperationInfo
 }
